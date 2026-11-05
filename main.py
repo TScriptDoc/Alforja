@@ -138,7 +138,28 @@ class DaemonManager:
             )
             return
 
-        cmd = ["unshare", "-r", "-n", str(self.binary_path)]
+        # Auto-cleanup any stale/lingering external llama-server processes to prevent VRAM or port collisions
+        try:
+            res = subprocess.run(["pgrep", "-f", "llama-server"], capture_output=True, text=True)
+            if res.returncode == 0:
+                pids = [int(p) for p in res.stdout.strip().split() if p.isdigit()]
+                for pid in pids:
+                    if not self.process or pid != self.process.pid:
+                        self._append_log(f"[Alforja] Found lingering llama-server (PID {pid}). Releasing VRAM...\n")
+                        try:
+                            os.kill(pid, signal.SIGTERM)
+                            time.sleep(0.3)
+                            os.kill(pid, signal.SIGKILL)
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+
+        # Prepare command with stdbuf if available for immediate line streaming
+        cmd = []
+        if shutil.which("stdbuf"):
+            cmd.extend(["stdbuf", "-oL", "-eL"])
+        cmd.extend(["unshare", "-r", "-n", str(self.binary_path)])
         if args:
             cmd.extend(args)
 

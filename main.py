@@ -1588,6 +1588,20 @@ class AlforjaWindow(Adw.ApplicationWindow):
         host = cfg.get("host", "127.0.0.1").strip() or "127.0.0.1"
         use_unshare = cfg.get("use_unshare", False)
 
+        # Build comprehensive aliases so clients like Alpaca never fail on model name mismatches
+        model_fname = self.active_model_path.name
+        stem_name = re.sub(r"(\.[qQ]\d[^.]*|\.gguf)$", "", model_fname)
+        raw_aliases = [
+            "default",
+            model_fname,
+            stem_name,
+            stem_name.lower(),
+            "gpt-3.5-turbo",
+            "gpt-4",
+            "gpt-4o",
+        ]
+        alias_str = ",".join(dict.fromkeys(a.strip() for a in raw_aliases if a and a.strip()))
+
         args = [
             "-m", str(self.active_model_path),
             "--host", host,
@@ -1601,7 +1615,7 @@ class AlforjaWindow(Adw.ApplicationWindow):
             "-ub", str(cfg["ubatch_size"]),
             "-b", str(cfg["batch_size"]),
             "-np", str(cfg["parallel"]),
-            "--alias", "default",
+            "--alias", alias_str,
         ]
 
         if cfg["ctx_shift"]:

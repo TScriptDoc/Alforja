@@ -15,6 +15,7 @@ import enum
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -62,6 +63,7 @@ DEFAULT_PROFILES = {
         "batch_size": 512,
         "parallel": 1,
         "ctx_shift": True,
+        "use_unshare": True,
         "custom_args": [],
     },
     "Low VRAM / 4K Context (KV Quantized)": {
@@ -76,6 +78,7 @@ DEFAULT_PROFILES = {
         "batch_size": 256,
         "parallel": 1,
         "ctx_shift": True,
+        "use_unshare": True,
         "custom_args": [],
     },
     "CPU & GPU Balanced": {
@@ -90,6 +93,7 @@ DEFAULT_PROFILES = {
         "batch_size": 512,
         "parallel": 1,
         "ctx_shift": False,
+        "use_unshare": True,
         "custom_args": [],
     },
 }
@@ -111,6 +115,7 @@ class DaemonManager:
         self.log_callback = None
         self.state_callback = None
         self.tps_callback = None
+        self.use_unshare: bool = True
         self._reader_thread: threading.Thread | None = None
 
     def set_callbacks(self, log_callback, state_callback, tps_callback=None):
@@ -155,17 +160,21 @@ class DaemonManager:
         except Exception:
             pass
 
-        # Prepare command with stdbuf if available for immediate line streaming
-        cmd = []
-        if shutil.which("stdbuf"):
-            cmd.extend(["stdbuf", "-oL", "-eL"])
+        self.use_unshare = use_unshare
+
+        binary_and_args = [str(self.binary_path)]
+        if args:
+            binary_and_args.extend(args)
 
         if use_unshare:
-            cmd.extend(["unshare", "-r", "-n"])
+            # Bring up the loopback interface inside the isolated namespace and exec llama-server
+            inner_cmd = "ip link set lo up && exec " + " ".join(shlex.quote(c) for c in binary_and_args)
+            cmd = ["unshare", "-r", "-n", "sh", "-c", inner_cmd]
+        else:
+            cmd = list(binary_and_args)
 
-        cmd.append(str(self.binary_path))
-        if args:
-            cmd.extend(args)
+        if shutil.which("stdbuf"):
+            cmd = ["stdbuf", "-oL", "-eL"] + cmd
 
         env = os.environ.copy()
         bin_dir = str(self.binary_path.parent)
@@ -524,6 +533,15 @@ class AlforjaWindow(Adw.ApplicationWindow):
         self.btn_stop.connect("clicked", self.on_stop_clicked)
         halter_box.append(self.btn_stop)
 
+        # Chat Button: Join/Launch Alpaca inside the same sandbox bubble
+        self.btn_alpaca = Gtk.Button(
+            icon_name="com.jeffser.Alpaca",
+            tooltip_text="Launch Alpaca Chat in Sandbox Bubble",
+        )
+        self.btn_alpaca.connect("clicked", self.on_launch_alpaca_clicked)
+        self.btn_alpaca.set_sensitive(False)
+        halter_box.append(self.btn_alpaca)
+
         self.header_bar.pack_start(halter_box)
 
         # HeaderBar Status Badge (Right side)
@@ -571,6 +589,15 @@ class AlforjaWindow(Adw.ApplicationWindow):
         self.row_state = Adw.ActionRow(title="Daemon State", subtitle="Stopped")
         self.icon_state = Gtk.Image.new_from_icon_name("network-offline-symbolic")
         self.row_state.add_prefix(self.icon_state)
+
+        self.btn_dash_alpaca = Gtk.Button(
+            label="Open Alpaca in Bubble",
+            icon_name="com.jeffser.Alpaca",
+        )
+        self.btn_dash_alpaca.set_valign(Gtk.Align.CENTER)
+        self.btn_dash_alpaca.connect("clicked", self.on_launch_alpaca_clicked)
+        self.btn_dash_alpaca.set_sensitive(False)
+        self.row_state.add_suffix(self.btn_dash_alpaca)
         status_group.add(self.row_state)
 
         self.row_active_model = Adw.ActionRow(
@@ -1459,6 +1486,8 @@ class AlforjaWindow(Adw.ApplicationWindow):
             self.btn_start.set_sensitive(True)
             self.btn_pause.set_sensitive(False)
             self.btn_stop.set_sensitive(False)
+            self.btn_alpaca.set_sensitive(False)
+            self.btn_dash_alpaca.set_sensitive(False)
             self.btn_pause.set_icon_name("media-playback-pause-symbolic")
             self.btn_pause.set_tooltip_text("Pause daemon (SIGSTOP)")
 
@@ -1480,6 +1509,8 @@ class AlforjaWindow(Adw.ApplicationWindow):
             self.btn_start.set_sensitive(False)
             self.btn_pause.set_sensitive(True)
             self.btn_stop.set_sensitive(True)
+            self.btn_alpaca.set_sensitive(True)
+            self.btn_dash_alpaca.set_sensitive(True)
             self.btn_pause.set_icon_name("media-playback-pause-symbolic")
             self.btn_pause.set_tooltip_text("Pause daemon (SIGSTOP)")
 
@@ -1496,6 +1527,8 @@ class AlforjaWindow(Adw.ApplicationWindow):
             self.btn_start.set_sensitive(False)
             self.btn_pause.set_sensitive(True)
             self.btn_stop.set_sensitive(True)
+            self.btn_alpaca.set_sensitive(False)
+            self.btn_dash_alpaca.set_sensitive(False)
             self.btn_pause.set_icon_name("media-playback-start-symbolic")
             self.btn_pause.set_tooltip_text("Resume daemon (SIGCONT)")
 
@@ -1567,6 +1600,41 @@ class AlforjaWindow(Adw.ApplicationWindow):
 
     def on_stop_clicked(self, _button):
         self.daemon.stop()
+
+    def on_launch_alpaca_clicked(self, _button):
+        """Launches Alpaca Flatpak joining the daemon's air-gapped sandbox bubble."""
+        if self.daemon.state != ProcessState.RUNNING:
+            self.on_log_message("[Alforja] Server must be running before launching Alpaca.\n")
+            return
+
+        pid = self.daemon.process.pid if self.daemon.process else None
+        if not pid:
+            return
+
+        if self.daemon.use_unshare:
+            cmd = [
+                "nsenter",
+                "-t", str(pid),
+                "-U", "-n",
+                "--preserve-credentials",
+                "flatpak", "run",
+                "--filesystem=host",
+                "com.jeffser.Alpaca",
+            ]
+            desc = "inside the shared air-gapped sandbox bubble"
+        else:
+            cmd = [
+                "flatpak", "run",
+                "--filesystem=host",
+                "com.jeffser.Alpaca",
+            ]
+            desc = "on local loopback (127.0.0.1)"
+
+        try:
+            subprocess.Popen(cmd)
+            self.on_log_message(f"[Alforja] Launched Alpaca {desc} (joining sandbox PID {pid}).\n")
+        except Exception as exc:
+            self.on_log_message(f"[Alforja Error] Failed to launch Alpaca: {exc}\n")
 
     # =========================================================================
     # CONFIGURATION & PROFILES IMPLEMENTATION

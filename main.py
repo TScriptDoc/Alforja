@@ -1283,18 +1283,21 @@ class AlforjaWindow(Adw.ApplicationWindow):
                 self.active_model_path and self.active_model_path.resolve() == path.resolve()
             )
 
+            actions_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+            actions_box.set_valign(Gtk.Align.CENTER)
+
             if is_active:
                 badge = Gtk.Label(label="Active")
                 badge.add_css_class("accent")
                 badge.set_valign(Gtk.Align.CENTER)
                 badge.set_margin_end(6)
-                row.add_suffix(badge)
+                actions_box.append(badge)
             elif is_mmproj:
                 badge = Gtk.Label(label="Projector")
                 badge.add_css_class("dim-label")
                 badge.set_valign(Gtk.Align.CENTER)
                 badge.set_margin_end(6)
-                row.add_suffix(badge)
+                actions_box.append(badge)
             else:
                 btn_activate = Gtk.Button(label="Activate")
                 btn_activate.set_valign(Gtk.Align.CENTER)
@@ -1302,10 +1305,66 @@ class AlforjaWindow(Adw.ApplicationWindow):
                     "clicked",
                     lambda _, p=path: self.on_model_activated(p),
                 )
-                row.add_suffix(btn_activate)
+                actions_box.append(btn_activate)
 
+            btn_delete = Gtk.Button(
+                icon_name="user-trash-symbolic",
+                tooltip_text=f"Delete {name} permanently",
+            )
+            btn_delete.add_css_class("flat")
+            btn_delete.set_valign(Gtk.Align.CENTER)
+            btn_delete.connect(
+                "clicked",
+                lambda _, p=path: self.on_delete_model_clicked(p),
+            )
+            actions_box.append(btn_delete)
+
+            row.add_suffix(actions_box)
             self.models_group.add(row)
             self.model_rows.append(row)
+
+    def on_delete_model_clicked(self, path: Path):
+        size_mb = path.stat().st_size / (1024 * 1024) if path.exists() else 0
+        size_str = f"{size_mb / 1024:.2f} GB" if size_mb >= 1024 else f"{size_mb:.1f} MB"
+
+        dialog = Adw.AlertDialog.new(
+            f"Delete {path.name}?",
+            f"Are you sure you want to permanently delete this file ({size_str}) from disk? This cannot be undone.",
+        )
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("delete", "Delete")
+        dialog.set_response_appearance("delete", Adw.ResponseAppearance.DESTRUCTIVE)
+        dialog.set_default_response("cancel")
+        dialog.set_close_response("cancel")
+
+        def on_response(dlg, response):
+            if response == "delete":
+                self.do_delete_model(path)
+
+        dialog.connect("response", on_response)
+        dialog.present(self)
+
+    def do_delete_model(self, path: Path):
+        try:
+            if self.daemon.state in (ProcessState.RUNNING, ProcessState.PAUSED):
+                if self.active_model_path and self.active_model_path.resolve() == path.resolve():
+                    self.daemon.stop()
+                    self.on_log_message("[Alforja] Stopped server because active model is being deleted.\n")
+
+            if self.active_model_path and self.active_model_path.resolve() == path.resolve():
+                self.active_model_path = None
+                self.active_mmproj_path = None
+                self.row_active_model.set_subtitle("None selected")
+                self.row_config_model.set_subtitle("None selected")
+
+            if path.exists():
+                path.unlink()
+                self.on_log_message(f"[Alforja] Permanently deleted model: {path.name}\n")
+
+            self.refresh_models_list()
+            self.save_active_config()
+        except Exception as exc:
+            self.on_log_message(f"[Alforja Error] Failed to delete model {path.name}: {exc}\n")
 
     def on_model_activated(self, path: Path):
         was_running = self.daemon.state in (ProcessState.RUNNING, ProcessState.PAUSED)

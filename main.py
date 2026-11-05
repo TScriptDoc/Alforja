@@ -10,9 +10,11 @@ Constraints & Architecture:
 - Pure stdlib + GTK4 / Libadwaita.
 """
 
+import collections
 import enum
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -36,7 +38,8 @@ except (ValueError, ModuleNotFoundError):
         os.execvp("flatpak-spawn", args)
     raise
 
-from gi.repository import Adw, Gio, GLib, GObject, Gtk, Pango
+import cairo
+from gi.repository import Adw, Gdk, Gio, GLib, GObject, Gtk, Pango
 
 
 DEFAULT_BINARY_PATH = Path.home() / ".local" / "llama.cpp" / "bin" / "llama-server"
@@ -107,11 +110,13 @@ class DaemonManager:
         self.state: ProcessState = ProcessState.STOPPED
         self.log_callback = None
         self.state_callback = None
+        self.tps_callback = None
         self._reader_thread: threading.Thread | None = None
 
-    def set_callbacks(self, log_callback, state_callback):
+    def set_callbacks(self, log_callback, state_callback, tps_callback=None):
         self.log_callback = log_callback
         self.state_callback = state_callback
+        self.tps_callback = tps_callback
 
     def _notify_state(self, new_state: ProcessState):
         self.state = new_state
@@ -133,12 +138,10 @@ class DaemonManager:
             )
             return
 
-        # Network sandbox: 'unshare -r -n' physically isolates daemon from network
         cmd = ["unshare", "-r", "-n", str(self.binary_path)]
         if args:
             cmd.extend(args)
 
-        # Ensure LD_LIBRARY_PATH discovers libllama and libggml shared libs
         env = os.environ.copy()
         bin_dir = str(self.binary_path.parent)
         existing_ld = env.get("LD_LIBRARY_PATH", "")
@@ -175,6 +178,17 @@ class DaemonManager:
 
         for line in proc.stdout:
             self._append_log(line)
+
+            # Check for generation/prompt tokens per second
+            if "tokens per second" in line and self.tps_callback:
+                m = re.search(r"([\d\.]+)\s+tokens per second", line)
+                if m:
+                    try:
+                        tps_val = float(m.group(1))
+                        is_prompt = "prompt eval" in line
+                        GLib.idle_add(self.tps_callback, tps_val, is_prompt)
+                    except Exception:
+                        pass
 
         proc.wait()
         retcode = proc.returncode
@@ -219,7 +233,6 @@ class DaemonManager:
         pid = self.process.pid
         self._append_log(f"[Alforja] Stopping server (PID: {pid})...\n")
 
-        # If paused, send SIGCONT first so it can process SIGTERM
         if self.state == ProcessState.PAUSED:
             try:
                 os.kill(pid, signal.SIGCONT)
@@ -227,7 +240,7 @@ class DaemonManager:
                 pass
 
         try:
-            self.process.terminate()  # SIGTERM
+            self.process.terminate()
 
             def wait_and_kill():
                 try:
@@ -327,7 +340,7 @@ class ModelDownloader:
                     log(f"[Downloader] Saving to: {dest_file}")
 
                     downloaded = 0
-                    chunk_size = 1024 * 1024  # 1 MB buffer
+                    chunk_size = 1024 * 1024
                     start_time = time.time()
                     last_log_time = start_time
 
@@ -379,7 +392,6 @@ class ModelDownloader:
                                 log(log_line)
                                 last_log_time = now
 
-                    # Atomically promote completed file
                     if part_file.exists():
                         part_file.replace(dest_file)
 
@@ -406,10 +418,14 @@ class AlforjaWindow(Adw.ApplicationWindow):
         super().__init__(**kwargs)
 
         self.set_title("Alforja")
-        self.set_default_size(980, 720)
+        self.set_default_size(1000, 740)
 
         self.daemon = DaemonManager()
-        self.daemon.set_callbacks(self.on_log_message, self.on_process_state_changed)
+        self.daemon.set_callbacks(
+            self.on_log_message,
+            self.on_process_state_changed,
+            self.on_tps_recorded,
+        )
 
         self.downloader = ModelDownloader()
         self.active_model_path: Path | None = None
@@ -421,10 +437,22 @@ class AlforjaWindow(Adw.ApplicationWindow):
         self.active_profile_name = "GTX 1650 (Default 4GB Safe)"
         self._loading_config = False
 
+        # Telemetry state
+        self.telemetry_enabled = True
+        self.tokens_history = collections.deque(maxlen=40)
+        self.current_tps = 0.0
+        self.prompt_tps = 0.0
+        self._prev_cpu_times: tuple[float, float] | None = None
+        self._telemetry_thread: threading.Thread | None = None
+        self._stop_telemetry = threading.Event()
+
         self.setup_ui()
         self.load_profiles_and_config()
         self.init_models()
         self.update_ui_state(ProcessState.STOPPED)
+
+        # Start background telemetry monitor
+        self._start_telemetry_worker()
 
     def setup_ui(self):
         self.main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
@@ -498,203 +526,26 @@ class AlforjaWindow(Adw.ApplicationWindow):
         self.main_box.append(self.view_switcher_bar)
 
     # =========================================================================
-    # CONFIGURATION PERSISTENCE & PROFILES
-    # =========================================================================
-    def load_profiles_and_config(self):
-        """Loads profiles and active config from ~/.config/alforja/."""
-        self._loading_config = True
-        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-
-        # 1. Load profiles
-        self.profiles = dict(DEFAULT_PROFILES)
-        if PROFILES_FILE.exists():
-            try:
-                with open(PROFILES_FILE, "r", encoding="utf-8") as f:
-                    saved_profiles = json.load(f)
-                    if isinstance(saved_profiles, dict):
-                        self.profiles.update(saved_profiles)
-            except Exception as exc:
-                print(f"[Config] Error reading profiles: {exc}")
-
-        self.update_profiles_combo()
-
-        # 2. Load active configuration
-        active_cfg = None
-        if CONFIG_FILE.exists():
-            try:
-                with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                    active_cfg = json.load(f)
-            except Exception as exc:
-                print(f"[Config] Error reading active config: {exc}")
-
-        if not active_cfg:
-            active_cfg = self.profiles.get(self.active_profile_name, DEFAULT_PROFILES["GTX 1650 (Default 4GB Safe)"])
-
-        self.apply_config_to_ui(active_cfg)
-        self._loading_config = False
-
-    def update_profiles_combo(self):
-        """Updates the profiles dropdown model."""
-        profile_names = list(self.profiles.keys())
-        self.profile_string_list = Gtk.StringList.new(profile_names)
-        self.combo_profile.set_model(self.profile_string_list)
-
-        if self.active_profile_name in profile_names:
-            idx = profile_names.index(self.active_profile_name)
-            self.combo_profile.set_selected(idx)
-
-    def apply_config_to_ui(self, cfg: dict):
-        """Applies configuration dictionary values to UI controls."""
-        self._loading_config = True
-
-        self.spin_ctx.set_value(cfg.get("ctx_size", 2048))
-        self.spin_ngl.set_value(cfg.get("gpu_layers", 24))
-        self.spin_threads.set_value(cfg.get("threads", 4))
-        self.spin_port.set_value(cfg.get("port", 8080))
-
-        fa_val = cfg.get("flash_attn", "auto")
-        self.set_combo_value(self.combo_flash_attn, ["auto", "on", "off"], fa_val)
-
-        ctk_val = cfg.get("cache_type_k", "f16")
-        self.set_combo_value(self.combo_ctk, ["f16", "q8_0", "q4_0"], ctk_val)
-
-        ctv_val = cfg.get("cache_type_v", "f16")
-        self.set_combo_value(self.combo_ctv, ["f16", "q8_0", "q4_0"], ctv_val)
-
-        self.spin_ubatch.set_value(cfg.get("ubatch_size", 256))
-        self.spin_batch.set_value(cfg.get("batch_size", 512))
-        self.spin_parallel.set_value(cfg.get("parallel", 1))
-        self.switch_ctx_shift.set_active(cfg.get("ctx_shift", True))
-
-        # Restore custom key-value arguments
-        self.clear_custom_args()
-        for item in cfg.get("custom_args", []):
-            if isinstance(item, dict):
-                self.add_custom_arg_row(item.get("flag", ""), item.get("value", ""))
-
-        saved_model = cfg.get("active_model")
-        if saved_model:
-            model_p = Path(saved_model)
-            if model_p.exists():
-                self.set_active_model(model_p)
-
-        self._loading_config = False
-
-    def set_combo_value(self, combo: Adw.ComboRow, options: list[str], val: str):
-        if val in options:
-            combo.set_selected(options.index(val))
-        else:
-            combo.set_selected(0)
-
-    def get_ui_config(self) -> dict:
-        """Collects current configuration from all UI widgets."""
-        fa_model = self.combo_flash_attn.get_model()
-        ctk_model = self.combo_ctk.get_model()
-        ctv_model = self.combo_ctv.get_model()
-
-        fa_val = fa_model.get_string(self.combo_flash_attn.get_selected()) if fa_model else "auto"
-        ctk_val = ctk_model.get_string(self.combo_ctk.get_selected()) if ctk_model else "f16"
-        ctv_val = ctv_model.get_string(self.combo_ctv.get_selected()) if ctv_model else "f16"
-
-        return {
-            "ctx_size": int(self.spin_ctx.get_value()),
-            "gpu_layers": int(self.spin_ngl.get_value()),
-            "threads": int(self.spin_threads.get_value()),
-            "port": int(self.spin_port.get_value()),
-            "flash_attn": fa_val,
-            "cache_type_k": ctk_val,
-            "cache_type_v": ctv_val,
-            "ubatch_size": int(self.spin_ubatch.get_value()),
-            "batch_size": int(self.spin_batch.get_value()),
-            "parallel": int(self.spin_parallel.get_value()),
-            "ctx_shift": self.switch_ctx_shift.get_active(),
-            "active_model": str(self.active_model_path) if self.active_model_path else "",
-            "custom_args": self.get_custom_args(),
-        }
-
-    def save_active_config(self):
-        """Auto-saves current UI configuration to config.json."""
-        if self._loading_config:
-            return
-        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-        cfg = self.get_ui_config()
-        try:
-            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-                json.dump(cfg, f, indent=2)
-        except Exception as exc:
-            print(f"[Config] Error saving config: {exc}")
-
-    def on_profile_selected(self, _combo, _param):
-        if self._loading_config:
-            return
-        idx = self.combo_profile.get_selected()
-        model = self.combo_profile.get_model()
-        if not model or idx < 0:
-            return
-        profile_name = model.get_string(idx)
-        if profile_name in self.profiles:
-            self.active_profile_name = profile_name
-            self.apply_config_to_ui(self.profiles[profile_name])
-            self.save_active_config()
-            self.on_log_message(f"[Alforja] Loaded profile: {profile_name}\n")
-
-    def on_save_profile_clicked(self, _button):
-        """Saves current settings into the active profile or a new one."""
-        cfg = self.get_ui_config()
-        self.profiles[self.active_profile_name] = cfg
-        try:
-            with open(PROFILES_FILE, "w", encoding="utf-8") as f:
-                json.dump(self.profiles, f, indent=2)
-            self.save_active_config()
-            self.on_log_message(f"[Alforja] Saved profile: {self.active_profile_name}\n")
-        except Exception as exc:
-            self.on_log_message(f"[Alforja Error] Failed saving profile: {exc}\n")
-
-    def init_models(self):
-        """Scans models and selects the first available if none is active."""
-        models = self.scan_models()
-        if models and not self.active_model_path:
-            for name, _, path in models:
-                if ".mmproj" not in name:
-                    self.set_active_model(path)
-                    break
-            if not self.active_model_path:
-                self.set_active_model(models[0][2])
-        self.refresh_models_list()
-
-    def set_active_model(self, model_path: Path):
-        self.active_model_path = model_path
-        name = model_path.name
-        self.row_active_model.set_subtitle(name)
-        self.row_config_model.set_subtitle(name)
-
-        # Detect matching vision projector
-        base_prefix = name.split(".")[0]
-        self.active_mmproj_path = None
-        for item in DEFAULT_MODELS_DIR.glob("*.gguf"):
-            if ".mmproj" in item.name and base_prefix.lower() in item.name.lower():
-                self.active_mmproj_path = item
-                break
-
-        self.save_active_config()
-
-    # =========================================================================
-    # TAB 1: DASHBOARD
+    # TAB 1: DASHBOARD (WITH LIVE HARDWARE TELEMETRY & TOKENS/S GRAPH)
     # =========================================================================
     def build_dashboard_page(self):
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        scrolled_page = Gtk.ScrolledWindow()
+        scrolled_page.set_vexpand(True)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
         box.set_margin_top(12)
-        box.set_margin_bottom(12)
+        box.set_margin_bottom(16)
         box.set_margin_start(16)
         box.set_margin_end(16)
+        scrolled_page.set_child(box)
 
-        # Status Group
-        pref_group = Adw.PreferencesGroup(title="System and Runtime Status")
+        # 1. System Status Group
+        status_group = Adw.PreferencesGroup(title="Daemon and Sandbox Status")
 
         self.row_state = Adw.ActionRow(title="Daemon State", subtitle="Stopped")
         self.icon_state = Gtk.Image.new_from_icon_name("network-offline-symbolic")
         self.row_state.add_prefix(self.icon_state)
-        pref_group.add(self.row_state)
+        status_group.add(self.row_state)
 
         self.row_active_model = Adw.ActionRow(
             title="Active Model",
@@ -703,7 +554,7 @@ class AlforjaWindow(Adw.ApplicationWindow):
         self.row_active_model.add_prefix(
             Gtk.Image.new_from_icon_name("application-x-executable-symbolic")
         )
-        pref_group.add(self.row_active_model)
+        status_group.add(self.row_active_model)
 
         self.row_sandbox = Adw.ActionRow(
             title="Sandbox Isolation",
@@ -712,20 +563,116 @@ class AlforjaWindow(Adw.ApplicationWindow):
         self.row_sandbox.add_prefix(
             Gtk.Image.new_from_icon_name("security-high-symbolic")
         )
-        pref_group.add(self.row_sandbox)
+        status_group.add(self.row_sandbox)
 
-        self.row_vram = Adw.ActionRow(
-            title="GPU and VRAM Profile",
-            subtitle="Nvidia GTX 1650 (4GB Limit Constraint)",
+        box.append(status_group)
+
+        # 2. Live Telemetry & Performance Widgets Group
+        self.telemetry_group = Adw.PreferencesGroup(
+            title="Live Hardware and Inference Telemetry",
+            description="Real-time monitoring of GTX 1650 VRAM, temperature, compute load, and token generation speed.",
         )
-        self.row_vram.add_prefix(
+
+        # Header suffix: Monitoring On/Off Switch to save CPU/GPU cycles
+        telem_toggle_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        telem_toggle_box.set_valign(Gtk.Align.CENTER)
+
+        lbl_toggle = Gtk.Label(label="Live Monitor")
+        lbl_toggle.add_css_class("dim-label")
+        telem_toggle_box.append(lbl_toggle)
+
+        self.switch_telemetry = Gtk.Switch()
+        self.switch_telemetry.set_active(True)
+        self.switch_telemetry.set_valign(Gtk.Align.CENTER)
+        self.switch_telemetry.connect("notify::active", self.on_telemetry_toggled)
+        telem_toggle_box.append(self.switch_telemetry)
+
+        self.telemetry_group.set_header_suffix(telem_toggle_box)
+
+        # Row A: Nvidia GPU & VRAM (GTX 1650)
+        self.row_gpu_vram = Adw.ActionRow(
+            title="GPU Compute: 0% • 37°C",
+            subtitle="VRAM Allocation: 0.0 / 4.0 GB (0%)",
+        )
+        self.row_gpu_vram.add_prefix(
             Gtk.Image.new_from_icon_name("video-display-symbolic")
         )
-        pref_group.add(self.row_vram)
 
-        box.append(pref_group)
+        # Dual progress bars container on the right of row
+        vram_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        vram_box.set_valign(Gtk.Align.CENTER)
+        vram_box.set_size_request(160, -1)
 
-        # Log Section
+        self.prog_gpu = Gtk.ProgressBar()
+        self.prog_gpu.set_fraction(0.0)
+        self.prog_gpu.set_tooltip_text("GPU Core Compute Load")
+        vram_box.append(self.prog_gpu)
+
+        self.prog_vram = Gtk.ProgressBar()
+        self.prog_vram.set_fraction(0.0)
+        self.prog_vram.set_tooltip_text("VRAM Usage (4GB Maximum Constraint)")
+        vram_box.append(self.prog_vram)
+
+        self.row_gpu_vram.add_suffix(vram_box)
+        self.telemetry_group.add(self.row_gpu_vram)
+
+        # Row B: Host CPU & RAM
+        self.row_cpu_ram = Adw.ActionRow(
+            title="CPU Usage: 0%",
+            subtitle="System RAM: 0.0 / 0.0 GB (0%)",
+        )
+        self.row_cpu_ram.add_prefix(
+            Gtk.Image.new_from_icon_name("computer-symbolic")
+        )
+
+        ram_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        ram_box.set_valign(Gtk.Align.CENTER)
+        ram_box.set_size_request(160, -1)
+
+        self.prog_cpu = Gtk.ProgressBar()
+        self.prog_cpu.set_fraction(0.0)
+        self.prog_cpu.set_tooltip_text("Host CPU Core Utilization")
+        ram_box.append(self.prog_cpu)
+
+        self.prog_ram = Gtk.ProgressBar()
+        self.prog_ram.set_fraction(0.0)
+        self.prog_ram.set_tooltip_text("Host RAM Utilization")
+        ram_box.append(self.prog_ram)
+
+        self.row_cpu_ram.add_suffix(ram_box)
+        self.telemetry_group.add(self.row_cpu_ram)
+
+        # Row C: Generation Speed & Real-Time Sparkline Graph
+        self.row_tokens = Adw.ActionRow(
+            title="Inference Speed: 0.0 tokens/sec",
+            subtitle="Prompt Processing: 0.0 t/s",
+        )
+        self.row_tokens.add_prefix(
+            Gtk.Image.new_from_icon_name("utilities-system-monitor-symbolic")
+            if Gtk.IconTheme.get_for_display(Gdk.Display.get_default()).has_icon("utilities-system-monitor-symbolic")
+            else Gtk.Image.new_from_icon_name("system-run-symbolic")
+        )
+
+        # Graph Container inside Card
+        graph_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        graph_box.set_margin_top(6)
+        graph_box.set_margin_bottom(6)
+        graph_box.set_margin_start(8)
+        graph_box.set_margin_end(8)
+
+        self.graph_tokens = Gtk.DrawingArea()
+        self.graph_tokens.set_content_width(320)
+        self.graph_tokens.set_content_height(84)
+        self.graph_tokens.add_css_class("card")
+        self.graph_tokens.set_draw_func(self.on_draw_tokens_graph)
+        graph_box.append(self.graph_tokens)
+
+        self.row_tokens.set_child(graph_box)
+        self.telemetry_group.add(self.row_tokens)
+
+        box.append(self.telemetry_group)
+
+        # 3. Log Section
         log_group = Adw.PreferencesGroup(title="Server Log Console")
 
         btn_clear = Gtk.Button(
@@ -738,7 +685,7 @@ class AlforjaWindow(Adw.ApplicationWindow):
 
         scrolled = Gtk.ScrolledWindow()
         scrolled.set_vexpand(True)
-        scrolled.set_min_content_height(280)
+        scrolled.set_min_content_height(260)
         scrolled.add_css_class("card")
 
         self.text_view = Gtk.TextView()
@@ -757,8 +704,212 @@ class AlforjaWindow(Adw.ApplicationWindow):
 
         box.append(log_group)
 
-        page = self.view_stack.add_titled(box, "dashboard", "Dashboard")
+        page = self.view_stack.add_titled(scrolled_page, "dashboard", "Dashboard")
         page.set_icon_name("system-run-symbolic")
+
+    # =========================================================================
+    # TELEMETRY MONITORING & GRAPHING
+    # =========================================================================
+    def on_telemetry_toggled(self, switch, _param):
+        self.telemetry_enabled = switch.get_active()
+        if not self.telemetry_enabled:
+            self.row_gpu_vram.set_title("GPU Compute: Monitoring Disabled (Resource Saver)")
+            self.row_cpu_ram.set_title("CPU Usage: Monitoring Disabled")
+            self.prog_gpu.set_fraction(0.0)
+            self.prog_vram.set_fraction(0.0)
+            self.prog_cpu.set_fraction(0.0)
+            self.prog_ram.set_fraction(0.0)
+        self.save_active_config()
+
+    def on_tps_recorded(self, tps_val: float, is_prompt: bool):
+        """Called when tokens/s regex is matched from daemon stdout."""
+        if is_prompt:
+            self.prompt_tps = tps_val
+        else:
+            self.current_tps = tps_val
+            self.tokens_history.append(tps_val)
+            self.graph_tokens.queue_draw()
+
+        self.row_tokens.set_title(
+            f"Generation Speed: {self.current_tps:.1f} tokens/sec"
+        )
+        self.row_tokens.set_subtitle(
+            f"Prompt Processing: {self.prompt_tps:.1f} t/s • Peak Generation: {max(self.tokens_history or [0.0]):.1f} t/s"
+        )
+        return GLib.SOURCE_REMOVE
+
+    def on_draw_tokens_graph(self, _area, cr, width, height):
+        """Draws a smooth Cairo line chart and gradient fill for tokens/sec."""
+        # Clean rounded background
+        cr.set_source_rgba(0.10, 0.10, 0.13, 0.95)
+        cr.rectangle(0, 0, width, height)
+        cr.fill()
+
+        if not self.tokens_history:
+            cr.set_source_rgba(0.55, 0.55, 0.60, 0.85)
+            cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
+            cr.set_font_size(12)
+            cr.move_to(width / 2 - 95, height / 2 + 4)
+            cr.show_text("Awaiting generation tokens/s...")
+            return
+
+        vals = list(self.tokens_history)
+        max_val = max(vals) if vals else 30.0
+        max_val = max(max_val, 10.0) * 1.20
+
+        # Subtle grid dashed line
+        cr.set_source_rgba(1.0, 1.0, 1.0, 0.08)
+        cr.set_dash([4.0, 4.0])
+        cr.move_to(0, height * 0.5)
+        cr.line_to(width, height * 0.5)
+        cr.stroke()
+        cr.set_dash([])
+
+        step_x = width / max(1, len(vals) - 1) if len(vals) > 1 else width
+
+        points = []
+        for i, v in enumerate(vals):
+            x = i * step_x
+            y = height - ((v / max_val) * (height - 18)) - 8
+            points.append((x, y))
+
+        # Gradient area fill under curve
+        cr.move_to(points[0][0], points[0][1])
+        for x, y in points[1:]:
+            cr.line_to(x, y)
+        cr.line_to(points[-1][0], height)
+        cr.line_to(points[0][0], height)
+        cr.close_path()
+
+        grad = cairo.LinearGradient(0, 0, 0, height)
+        grad.add_color_stop_rgba(0.0, 0.21, 0.52, 0.95, 0.45)
+        grad.add_color_stop_rgba(1.0, 0.21, 0.52, 0.95, 0.02)
+        cr.set_source(grad)
+        cr.fill()
+
+        # Stroke curve
+        cr.set_source_rgba(0.25, 0.58, 1.0, 1.0)
+        cr.set_line_width(2.4)
+        cr.move_to(points[0][0], points[0][1])
+        for x, y in points[1:]:
+            cr.line_to(x, y)
+        cr.stroke()
+
+        # Last point indicator
+        last_x, last_y = points[-1]
+        cr.arc(last_x, last_y, 4.0, 0, 2 * 3.14159)
+        cr.set_source_rgba(0.25, 0.58, 1.0, 1.0)
+        cr.fill()
+
+        # Text overlay
+        cr.set_source_rgba(0.95, 0.95, 0.98, 0.95)
+        cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+        cr.set_font_size(11)
+        cr.move_to(10, 16)
+        cr.show_text(f"Live: {vals[-1]:.1f} t/s  (Peak: {max(vals):.1f} t/s)")
+
+    def _start_telemetry_worker(self):
+        """Background thread polling system stats every 1.5s only when running."""
+        def worker():
+            while not self._stop_telemetry.is_set():
+                if self.daemon.state == ProcessState.RUNNING and self.telemetry_enabled:
+                    gpu_util, gpu_temp, vram_u, vram_t = self._poll_gpu()
+                    cpu_pct, ram_u, ram_t = self._poll_cpu_ram()
+                    GLib.idle_add(
+                        self._apply_telemetry_update,
+                        gpu_util,
+                        gpu_temp,
+                        vram_u,
+                        vram_t,
+                        cpu_pct,
+                        ram_u,
+                        ram_t,
+                    )
+                time.sleep(1.5)
+
+        self._telemetry_thread = threading.Thread(target=worker, daemon=True)
+        self._telemetry_thread.start()
+
+    def _poll_gpu(self) -> tuple[float, float, float, float]:
+        """Polls Nvidia GTX 1650 via nvidia-smi."""
+        try:
+            cmd = [
+                "nvidia-smi",
+                "--query-gpu=utilization.gpu,temperature.gpu,memory.used,memory.total",
+                "--format=csv,noheader,nounits",
+            ]
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=1.0)
+            if res.returncode == 0 and res.stdout.strip():
+                parts = [float(x.strip()) for x in res.stdout.strip().split(",")]
+                if len(parts) >= 4:
+                    return parts[0], parts[1], parts[2], parts[3]
+        except Exception:
+            pass
+        return 0.0, 0.0, 0.0, 4096.0
+
+    def _poll_cpu_ram(self) -> tuple[float, float, float]:
+        """Reads /proc/stat and /proc/meminfo with zero external bloat."""
+        cpu_pct = 0.0
+        try:
+            with open("/proc/stat", "r") as f:
+                fields = [float(x) for x in f.readline().split()[1:]]
+            idle = fields[3] + fields[4]
+            total = sum(fields)
+            if self._prev_cpu_times:
+                prev_idle, prev_total = self._prev_cpu_times
+                d_idle = idle - prev_idle
+                d_total = total - prev_total
+                if d_total > 0:
+                    cpu_pct = (1.0 - (d_idle / d_total)) * 100.0
+            self._prev_cpu_times = (idle, total)
+        except Exception:
+            pass
+
+        ram_u, ram_t = 0.0, 0.0
+        try:
+            mem = {}
+            with open("/proc/meminfo", "r") as f:
+                for line in f:
+                    p = line.split(":")
+                    if len(p) == 2:
+                        mem[p[0].strip()] = int(p[1].split()[0])
+            total_gb = mem.get("MemTotal", 0) / (1024 * 1024)
+            avail_gb = mem.get("MemAvailable", 0) / (1024 * 1024)
+            ram_t = total_gb
+            ram_u = total_gb - avail_gb
+        except Exception:
+            pass
+
+        return cpu_pct, ram_u, ram_t
+
+    def _apply_telemetry_update(
+        self, gpu_util, gpu_temp, vram_u, vram_t, cpu_pct, ram_u, ram_t
+    ):
+        if not self.telemetry_enabled or self.daemon.state != ProcessState.RUNNING:
+            return GLib.SOURCE_REMOVE
+
+        # Update GPU & VRAM
+        vram_gb_u = vram_u / 1024.0
+        vram_gb_t = vram_t / 1024.0
+        vram_pct = (vram_u / vram_t) if vram_t > 0 else 0.0
+
+        self.row_gpu_vram.set_title(f"GPU Compute: {gpu_util:.0f}% • {gpu_temp:.0f}°C")
+        self.row_gpu_vram.set_subtitle(
+            f"VRAM Allocation: {vram_gb_u:.2f} / {vram_gb_t:.1f} GB ({vram_pct*100:.1f}%)"
+        )
+        self.prog_gpu.set_fraction(min(1.0, max(0.0, gpu_util / 100.0)))
+        self.prog_vram.set_fraction(min(1.0, max(0.0, vram_pct)))
+
+        # Update CPU & RAM
+        ram_pct = (ram_u / ram_t) if ram_t > 0 else 0.0
+        self.row_cpu_ram.set_title(f"CPU Core Usage: {cpu_pct:.1f}%")
+        self.row_cpu_ram.set_subtitle(
+            f"System RAM: {ram_u:.1f} / {ram_t:.1f} GB ({ram_pct*100:.1f}%)"
+        )
+        self.prog_cpu.set_fraction(min(1.0, max(0.0, cpu_pct / 100.0)))
+        self.prog_ram.set_fraction(min(1.0, max(0.0, ram_pct)))
+
+        return GLib.SOURCE_REMOVE
 
     # =========================================================================
     # TAB 2: CONFIGURATION (THE HARNESS)
@@ -807,7 +958,6 @@ class AlforjaWindow(Adw.ApplicationWindow):
         self.row_config_model.add_suffix(btn_goto_models)
         core_group.add(self.row_config_model)
 
-        # Context Size (-c)
         self.spin_ctx = Adw.SpinRow.new_with_range(512, 65536, 512)
         self.spin_ctx.set_title("Context Window Size (-c)")
         self.spin_ctx.set_subtitle("Tokens allocated for model memory.")
@@ -815,7 +965,6 @@ class AlforjaWindow(Adw.ApplicationWindow):
         self.spin_ctx.connect("notify::value", lambda *_: self.save_active_config())
         core_group.add(self.spin_ctx)
 
-        # GPU Offloading (-ngl)
         self.spin_ngl = Adw.SpinRow.new_with_range(0, 128, 1)
         self.spin_ngl.set_title("GPU Layers to Offload (-ngl)")
         self.spin_ngl.set_subtitle("Layers offloaded to GTX 1650 (4GB VRAM constraint).")
@@ -823,7 +972,6 @@ class AlforjaWindow(Adw.ApplicationWindow):
         self.spin_ngl.connect("notify::value", lambda *_: self.save_active_config())
         core_group.add(self.spin_ngl)
 
-        # Threads (-t)
         self.spin_threads = Adw.SpinRow.new_with_range(1, 64, 1)
         self.spin_threads.set_title("CPU Threads (-t)")
         self.spin_threads.set_subtitle("Thread count for CPU compute kernels.")
@@ -831,7 +979,6 @@ class AlforjaWindow(Adw.ApplicationWindow):
         self.spin_threads.connect("notify::value", lambda *_: self.save_active_config())
         core_group.add(self.spin_threads)
 
-        # Port (--port)
         self.spin_port = Adw.SpinRow.new_with_range(1024, 65535, 1)
         self.spin_port.set_title("Server Port (--port)")
         self.spin_port.set_subtitle("Local port binding (isolated within namespace).")
@@ -847,7 +994,6 @@ class AlforjaWindow(Adw.ApplicationWindow):
             description="Tuning options for 4GB VRAM headroom and KV cache efficiency.",
         )
 
-        # Flash Attention (-fa)
         self.combo_flash_attn = Adw.ComboRow(
             title="Flash Attention (-fa)",
             subtitle="Drastically reduces VRAM footprint of attention tensors.",
@@ -856,7 +1002,6 @@ class AlforjaWindow(Adw.ApplicationWindow):
         self.combo_flash_attn.connect("notify::selected", lambda *_: self.save_active_config())
         opt_group.add(self.combo_flash_attn)
 
-        # KV Cache Type K (-ctk)
         self.combo_ctk = Adw.ComboRow(
             title="KV Cache Quantization K (-ctk)",
             subtitle="q4_0 / q8_0 halves context VRAM usage vs f16.",
@@ -865,7 +1010,6 @@ class AlforjaWindow(Adw.ApplicationWindow):
         self.combo_ctk.connect("notify::selected", lambda *_: self.save_active_config())
         opt_group.add(self.combo_ctk)
 
-        # KV Cache Type V (-ctv)
         self.combo_ctv = Adw.ComboRow(
             title="KV Cache Quantization V (-ctv)",
             subtitle="Quantizes V tensors in context cache.",
@@ -874,7 +1018,6 @@ class AlforjaWindow(Adw.ApplicationWindow):
         self.combo_ctv.connect("notify::selected", lambda *_: self.save_active_config())
         opt_group.add(self.combo_ctv)
 
-        # Micro-batch size (-ub)
         self.spin_ubatch = Adw.SpinRow.new_with_range(32, 2048, 32)
         self.spin_ubatch.set_title("Physical Micro-batch Size (-ub)")
         self.spin_ubatch.set_subtitle("Controls peak VRAM allocation spikes during prompt processing.")
@@ -882,7 +1025,6 @@ class AlforjaWindow(Adw.ApplicationWindow):
         self.spin_ubatch.connect("notify::value", lambda *_: self.save_active_config())
         opt_group.add(self.spin_ubatch)
 
-        # Logical batch size (-b)
         self.spin_batch = Adw.SpinRow.new_with_range(64, 4096, 64)
         self.spin_batch.set_title("Logical Batch Size (-b)")
         self.spin_batch.set_subtitle("Maximum logical batch size.")
@@ -890,7 +1032,6 @@ class AlforjaWindow(Adw.ApplicationWindow):
         self.spin_batch.connect("notify::value", lambda *_: self.save_active_config())
         opt_group.add(self.spin_batch)
 
-        # Parallel decoding slots (-np)
         self.spin_parallel = Adw.SpinRow.new_with_range(1, 16, 1)
         self.spin_parallel.set_title("Parallel Slots (-np)")
         self.spin_parallel.set_subtitle("Number of simultaneous inference slots (keep 1 on 4GB VRAM).")
@@ -898,7 +1039,6 @@ class AlforjaWindow(Adw.ApplicationWindow):
         self.spin_parallel.connect("notify::value", lambda *_: self.save_active_config())
         opt_group.add(self.spin_parallel)
 
-        # Context Shift (--ctx-shift)
         self.switch_ctx_shift = Adw.SwitchRow(
             title="Context Shift (--ctx-shift)",
             subtitle="Discards older context tokens to keep chatting without crashing.",
@@ -929,7 +1069,6 @@ class AlforjaWindow(Adw.ApplicationWindow):
         page.set_icon_name("preferences-system-symbolic")
 
     def add_custom_arg_row(self, flag: str = "", value: str = ""):
-        """Adds a key-value row for arbitrary CLI flags."""
         row = Adw.ActionRow()
 
         box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
@@ -1015,7 +1154,6 @@ class AlforjaWindow(Adw.ApplicationWindow):
         page.set_icon_name("drive-harddisk-symbolic")
 
     def scan_models(self) -> list[tuple[str, float, Path]]:
-        """Scans ~/.local/llama.cpp/models for .gguf files."""
         if not DEFAULT_MODELS_DIR.exists():
             return []
         results = []
@@ -1029,7 +1167,6 @@ class AlforjaWindow(Adw.ApplicationWindow):
         return results
 
     def refresh_models_list(self):
-        """Rebuilds the rows in the models group."""
         for row in self.model_rows:
             self.models_group.remove(row)
         self.model_rows.clear()
@@ -1289,6 +1426,12 @@ class AlforjaWindow(Adw.ApplicationWindow):
             self.row_state.set_subtitle("Stopped")
             self.icon_state.set_from_icon_name("network-offline-symbolic")
 
+            self.row_gpu_vram.set_title("GPU Compute: Idle (Server Stopped)")
+            self.row_cpu_ram.set_title("CPU Usage: Idle")
+            self.prog_gpu.set_fraction(0.0)
+            self.prog_vram.set_fraction(0.0)
+            self.prog_cpu.set_fraction(0.0)
+
         elif state == ProcessState.RUNNING:
             self.status_badge.set_label("Running")
             self.status_badge.remove_css_class("dim-label")
@@ -1320,6 +1463,8 @@ class AlforjaWindow(Adw.ApplicationWindow):
             pid = self.daemon.process.pid if self.daemon.process else "N/A"
             self.row_state.set_subtitle(f"Paused (SIGSTOP frozen, PID: {pid})")
             self.icon_state.set_from_icon_name("media-playback-pause-symbolic")
+
+            self.row_gpu_vram.set_title("GPU Compute: Paused (VRAM Retained in Background)")
 
     def on_start_clicked(self, _button):
         if not self.active_model_path or not self.active_model_path.exists():
@@ -1372,6 +1517,182 @@ class AlforjaWindow(Adw.ApplicationWindow):
 
     def on_stop_clicked(self, _button):
         self.daemon.stop()
+
+    # =========================================================================
+    # CONFIGURATION & PROFILES IMPLEMENTATION
+    # =========================================================================
+    def load_profiles_and_config(self):
+        self._loading_config = True
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+
+        self.profiles = dict(DEFAULT_PROFILES)
+        if PROFILES_FILE.exists():
+            try:
+                with open(PROFILES_FILE, "r", encoding="utf-8") as f:
+                    saved_profiles = json.load(f)
+                    if isinstance(saved_profiles, dict):
+                        self.profiles.update(saved_profiles)
+            except Exception as exc:
+                print(f"[Config] Error reading profiles: {exc}")
+
+        self.update_profiles_combo()
+
+        active_cfg = None
+        if CONFIG_FILE.exists():
+            try:
+                with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                    active_cfg = json.load(f)
+            except Exception as exc:
+                print(f"[Config] Error reading active config: {exc}")
+
+        if not active_cfg:
+            active_cfg = self.profiles.get(
+                self.active_profile_name, DEFAULT_PROFILES["GTX 1650 (Default 4GB Safe)"]
+            )
+
+        self.apply_config_to_ui(active_cfg)
+        self._loading_config = False
+
+    def update_profiles_combo(self):
+        profile_names = list(self.profiles.keys())
+        self.profile_string_list = Gtk.StringList.new(profile_names)
+        self.combo_profile.set_model(self.profile_string_list)
+
+        if self.active_profile_name in profile_names:
+            idx = profile_names.index(self.active_profile_name)
+            self.combo_profile.set_selected(idx)
+
+    def apply_config_to_ui(self, cfg: dict):
+        self._loading_config = True
+
+        self.spin_ctx.set_value(cfg.get("ctx_size", 2048))
+        self.spin_ngl.set_value(cfg.get("gpu_layers", 24))
+        self.spin_threads.set_value(cfg.get("threads", 4))
+        self.spin_port.set_value(cfg.get("port", 8080))
+
+        fa_val = cfg.get("flash_attn", "auto")
+        self.set_combo_value(self.combo_flash_attn, ["auto", "on", "off"], fa_val)
+
+        ctk_val = cfg.get("cache_type_k", "f16")
+        self.set_combo_value(self.combo_ctk, ["f16", "q8_0", "q4_0"], ctk_val)
+
+        ctv_val = cfg.get("cache_type_v", "f16")
+        self.set_combo_value(self.combo_ctv, ["f16", "q8_0", "q4_0"], ctv_val)
+
+        self.spin_ubatch.set_value(cfg.get("ubatch_size", 256))
+        self.spin_batch.set_value(cfg.get("batch_size", 512))
+        self.spin_parallel.set_value(cfg.get("parallel", 1))
+        self.switch_ctx_shift.set_active(cfg.get("ctx_shift", True))
+
+        self.telemetry_enabled = cfg.get("telemetry_enabled", True)
+        self.switch_telemetry.set_active(self.telemetry_enabled)
+
+        self.clear_custom_args()
+        for item in cfg.get("custom_args", []):
+            if isinstance(item, dict):
+                self.add_custom_arg_row(item.get("flag", ""), item.get("value", ""))
+
+        saved_model = cfg.get("active_model")
+        if saved_model:
+            model_p = Path(saved_model)
+            if model_p.exists():
+                self.set_active_model(model_p)
+
+        self._loading_config = False
+
+    def set_combo_value(self, combo: Adw.ComboRow, options: list[str], val: str):
+        if val in options:
+            combo.set_selected(options.index(val))
+        else:
+            combo.set_selected(0)
+
+    def get_ui_config(self) -> dict:
+        fa_model = self.combo_flash_attn.get_model()
+        ctk_model = self.combo_ctk.get_model()
+        ctv_model = self.combo_ctv.get_model()
+
+        fa_val = fa_model.get_string(self.combo_flash_attn.get_selected()) if fa_model else "auto"
+        ctk_val = ctk_model.get_string(self.combo_ctk.get_selected()) if ctk_model else "f16"
+        ctv_val = ctv_model.get_string(self.combo_ctv.get_selected()) if ctv_model else "f16"
+
+        return {
+            "ctx_size": int(self.spin_ctx.get_value()),
+            "gpu_layers": int(self.spin_ngl.get_value()),
+            "threads": int(self.spin_threads.get_value()),
+            "port": int(self.spin_port.get_value()),
+            "flash_attn": fa_val,
+            "cache_type_k": ctk_val,
+            "cache_type_v": ctv_val,
+            "ubatch_size": int(self.spin_ubatch.get_value()),
+            "batch_size": int(self.spin_batch.get_value()),
+            "parallel": int(self.spin_parallel.get_value()),
+            "ctx_shift": self.switch_ctx_shift.get_active(),
+            "telemetry_enabled": self.switch_telemetry.get_active(),
+            "active_model": str(self.active_model_path) if self.active_model_path else "",
+            "custom_args": self.get_custom_args(),
+        }
+
+    def save_active_config(self):
+        if self._loading_config:
+            return
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        cfg = self.get_ui_config()
+        try:
+            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, indent=2)
+        except Exception as exc:
+            print(f"[Config] Error saving config: {exc}")
+
+    def on_profile_selected(self, _combo, _param):
+        if self._loading_config:
+            return
+        idx = self.combo_profile.get_selected()
+        model = self.combo_profile.get_model()
+        if not model or idx < 0:
+            return
+        profile_name = model.get_string(idx)
+        if profile_name in self.profiles:
+            self.active_profile_name = profile_name
+            self.apply_config_to_ui(self.profiles[profile_name])
+            self.save_active_config()
+            self.on_log_message(f"[Alforja] Loaded profile: {profile_name}\n")
+
+    def on_save_profile_clicked(self, _button):
+        cfg = self.get_ui_config()
+        self.profiles[self.active_profile_name] = cfg
+        try:
+            with open(PROFILES_FILE, "w", encoding="utf-8") as f:
+                json.dump(self.profiles, f, indent=2)
+            self.save_active_config()
+            self.on_log_message(f"[Alforja] Saved profile: {self.active_profile_name}\n")
+        except Exception as exc:
+            self.on_log_message(f"[Alforja Error] Failed saving profile: {exc}\n")
+
+    def init_models(self):
+        models = self.scan_models()
+        if models and not self.active_model_path:
+            for name, _, path in models:
+                if ".mmproj" not in name:
+                    self.set_active_model(path)
+                    break
+            if not self.active_model_path:
+                self.set_active_model(models[0][2])
+        self.refresh_models_list()
+
+    def set_active_model(self, model_path: Path):
+        self.active_model_path = model_path
+        name = model_path.name
+        self.row_active_model.set_subtitle(name)
+        self.row_config_model.set_subtitle(name)
+
+        base_prefix = name.split(".")[0]
+        self.active_mmproj_path = None
+        for item in DEFAULT_MODELS_DIR.glob("*.gguf"):
+            if ".mmproj" in item.name and base_prefix.lower() in item.name.lower():
+                self.active_mmproj_path = item
+                break
+
+        self.save_active_config()
 
 
 class AlforjaApp(Adw.Application):

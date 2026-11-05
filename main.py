@@ -127,7 +127,7 @@ class DaemonManager:
         if self.log_callback:
             GLib.idle_add(self.log_callback, text)
 
-    def start(self, args: list[str] | None = None):
+    def start(self, args: list[str] | None = None, use_unshare: bool = False):
         if self.state != ProcessState.STOPPED:
             self._append_log("[Alforja] Server is already running or paused.\n")
             return
@@ -159,7 +159,11 @@ class DaemonManager:
         cmd = []
         if shutil.which("stdbuf"):
             cmd.extend(["stdbuf", "-oL", "-eL"])
-        cmd.extend(["unshare", "-r", "-n", str(self.binary_path)])
+
+        if use_unshare:
+            cmd.extend(["unshare", "-r", "-n"])
+
+        cmd.append(str(self.binary_path))
         if args:
             cmd.extend(args)
 
@@ -179,8 +183,9 @@ class DaemonManager:
                 env=env,
             )
             self._notify_state(ProcessState.RUNNING)
+            mode_desc = "air-gapped namespace (unshare -n)" if use_unshare else "local loopback (127.0.0.1)"
             self._append_log(
-                f"[Alforja] Server started in network sandbox (PID: {self.process.pid}).\n"
+                f"[Alforja] Server started ({mode_desc}, PID: {self.process.pid}).\n"
             )
 
             self._reader_thread = threading.Thread(
@@ -1000,9 +1005,14 @@ class AlforjaWindow(Adw.ApplicationWindow):
         self.spin_threads.connect("notify::value", lambda *_: self.save_active_config())
         core_group.add(self.spin_threads)
 
+        self.entry_host = Adw.EntryRow(title="Host Interface (--host)")
+        self.entry_host.set_text("127.0.0.1")
+        self.entry_host.connect("changed", lambda *_: self.save_active_config())
+        core_group.add(self.entry_host)
+
         self.spin_port = Adw.SpinRow.new_with_range(1024, 65535, 1)
         self.spin_port.set_title("Server Port (--port)")
-        self.spin_port.set_subtitle("Local port binding (isolated within namespace).")
+        self.spin_port.set_subtitle("Local port binding.")
         self.spin_port.set_value(8080)
         self.spin_port.connect("notify::value", lambda *_: self.save_active_config())
         core_group.add(self.spin_port)
@@ -1067,6 +1077,14 @@ class AlforjaWindow(Adw.ApplicationWindow):
         self.switch_ctx_shift.set_active(True)
         self.switch_ctx_shift.connect("notify::active", lambda *_: self.save_active_config())
         opt_group.add(self.switch_ctx_shift)
+
+        self.switch_unshare = Adw.SwitchRow(
+            title="Air-gapped Network Namespace (unshare -n)",
+            subtitle="Isolates server from all host networking. Keep OFF to allow local chat clients (Alpaca, Open WebUI) to connect via localhost.",
+        )
+        self.switch_unshare.set_active(False)
+        self.switch_unshare.connect("notify::active", lambda *_: self.save_active_config())
+        opt_group.add(self.switch_unshare)
 
         pref_page.add(opt_group)
 
@@ -1499,18 +1517,23 @@ class AlforjaWindow(Adw.ApplicationWindow):
                 return
 
         cfg = self.get_ui_config()
+        host = cfg.get("host", "127.0.0.1").strip() or "127.0.0.1"
+        use_unshare = cfg.get("use_unshare", False)
+
         args = [
             "-m", str(self.active_model_path),
+            "--host", host,
+            "--port", str(cfg["port"]),
             "-c", str(cfg["ctx_size"]),
             "-ngl", str(cfg["gpu_layers"]),
             "-t", str(cfg["threads"]),
-            "--port", str(cfg["port"]),
             "-fa", cfg["flash_attn"],
             "-ctk", cfg["cache_type_k"],
             "-ctv", cfg["cache_type_v"],
             "-ub", str(cfg["ubatch_size"]),
             "-b", str(cfg["batch_size"]),
             "-np", str(cfg["parallel"]),
+            "--alias", "default",
         ]
 
         if cfg["ctx_shift"]:
@@ -1527,8 +1550,14 @@ class AlforjaWindow(Adw.ApplicationWindow):
                 if val:
                     args.append(val)
 
+        # Update dashboard sandbox indicator
+        if use_unshare:
+            self.row_sandbox.set_subtitle("Air-gapped namespace (unshare -n) - Host network blocked")
+        else:
+            self.row_sandbox.set_subtitle(f"Local Loopback ({host}:{cfg['port']}) - Offline & accessible to Alpaca")
+
         self.save_active_config()
-        self.daemon.start(args)
+        self.daemon.start(args, use_unshare=use_unshare)
 
     def on_pause_clicked(self, _button):
         if self.daemon.state == ProcessState.RUNNING:
@@ -1589,6 +1618,7 @@ class AlforjaWindow(Adw.ApplicationWindow):
         self.spin_ctx.set_value(cfg.get("ctx_size", 2048))
         self.spin_ngl.set_value(cfg.get("gpu_layers", 24))
         self.spin_threads.set_value(cfg.get("threads", 4))
+        self.entry_host.set_text(cfg.get("host", "127.0.0.1"))
         self.spin_port.set_value(cfg.get("port", 8080))
 
         fa_val = cfg.get("flash_attn", "auto")
@@ -1604,6 +1634,7 @@ class AlforjaWindow(Adw.ApplicationWindow):
         self.spin_batch.set_value(cfg.get("batch_size", 512))
         self.spin_parallel.set_value(cfg.get("parallel", 1))
         self.switch_ctx_shift.set_active(cfg.get("ctx_shift", True))
+        self.switch_unshare.set_active(cfg.get("use_unshare", False))
 
         self.telemetry_enabled = cfg.get("telemetry_enabled", True)
         self.switch_telemetry.set_active(self.telemetry_enabled)
@@ -1640,6 +1671,7 @@ class AlforjaWindow(Adw.ApplicationWindow):
             "ctx_size": int(self.spin_ctx.get_value()),
             "gpu_layers": int(self.spin_ngl.get_value()),
             "threads": int(self.spin_threads.get_value()),
+            "host": self.entry_host.get_text().strip() or "127.0.0.1",
             "port": int(self.spin_port.get_value()),
             "flash_attn": fa_val,
             "cache_type_k": ctk_val,
@@ -1648,6 +1680,7 @@ class AlforjaWindow(Adw.ApplicationWindow):
             "batch_size": int(self.spin_batch.get_value()),
             "parallel": int(self.spin_parallel.get_value()),
             "ctx_shift": self.switch_ctx_shift.get_active(),
+            "use_unshare": self.switch_unshare.get_active(),
             "telemetry_enabled": self.switch_telemetry.get_active(),
             "active_model": str(self.active_model_path) if self.active_model_path else "",
             "custom_args": self.get_custom_args(),

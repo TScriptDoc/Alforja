@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.alforja.Alforja</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <name>Alforja</name>
+  <summary>Native GTK4/Libadwaita graphical manager for llama.cpp</summary>
+  <description>
+    <p>
+      Alforja is a lightweight Linux desktop application designed to control and configure local llama-server instances.
+    </p>
+    <ul>
+      <li>Granular daemon lifecycle: Start, Stop, and Pause (SIGSTOP freezes execution while preserving VRAM).</li>
+      <li>Strict offline network sandbox: Runs llama-server isolated via Linux unshare namespaces.</li>
+      <li>VRAM-tuned for consumer hardware like the Nvidia GTX 1650 (Flash Attention, KV cache quantization, micro-batch tuning).</li>
+      <li>Built-in direct URL model downloader with real-time transfer stats.</li>
+    </ul>
+  </description>
+  <launchable type="desktop-id">io.github.alforja.Alforja.desktop</launchable>
+  <provides>
+    <binary>alforja</binary>
+  </provides>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="0.1.0" date="2026-11-05">
+      <description>
+        <p>Initial release of Alforja with GTK4 / Libadwaita interface, Halter controls, configuration profiles, and model downloader.</p>
+      </description>
+    </release>
+  </releases>
+</component>

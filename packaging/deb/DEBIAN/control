@@ -1,0 +1,13 @@
+Package: alforja
+Version: 0.1.0
+Section: utils
+Priority: optional
+Architecture: all
+Maintainer: Tiago <tiago@local>
+Depends: python3, python3-gi, gir1.2-gtk-4.0, gir1.2-adw-1, util-linux
+Description: Native GTK4/Libadwaita graphical manager for llama.cpp
+ Alforja (Andean saddlebag) is a native Linux desktop application built with
+ Python, GTK4, and Libadwaita to manage and configure local llama.cpp servers.
+ Features network sandboxing via unshare, granular process lifecycle control
+ (including SIGSTOP pause to freeze VRAM state), hardware-aware performance
+ presets for 4GB GPUs (Nvidia GTX 1650), and an integrated model downloader.

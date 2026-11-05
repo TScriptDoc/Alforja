@@ -1,0 +1,21 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Temporary and partial download files
+*.part
+*.download
+
+# Packaging build artifacts
+build/
+dist/
+*.egg-info/
+*.rpm
+*.deb
+
+# Local user configs / scratch files
+.vscode/
+.idea/
+*.swp
+*~

@@ -1308,9 +1308,27 @@ class AlforjaWindow(Adw.ApplicationWindow):
             self.model_rows.append(row)
 
     def on_model_activated(self, path: Path):
+        was_running = self.daemon.state in (ProcessState.RUNNING, ProcessState.PAUSED)
         self.set_active_model(path)
         self.refresh_models_list()
         self.on_log_message(f"[Alforja] Active model set to: {path.name}\n")
+
+        if was_running:
+            self.on_log_message(
+                f"[Alforja] Server is active. Automatically restarting to release VRAM and load {path.name}...\n"
+            )
+            self.daemon.stop()
+
+            def restart_worker():
+                # Wait until daemon process is fully dead and VRAM is freed
+                for _ in range(30):
+                    if not self.daemon.process:
+                        break
+                    time.sleep(0.1)
+                time.sleep(0.5)
+                GLib.idle_add(lambda: self.on_start_clicked(None))
+
+            threading.Thread(target=restart_worker, daemon=True).start()
 
     def on_open_models_dir(self, _button):
         DEFAULT_MODELS_DIR.mkdir(parents=True, exist_ok=True)

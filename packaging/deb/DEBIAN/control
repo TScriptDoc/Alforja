@@ -11,3 +11,4 @@ Description: Native GTK4/Libadwaita graphical manager for llama.cpp
  Features network sandboxing via unshare, granular process lifecycle control
  (including SIGSTOP pause to freeze VRAM state), hardware-aware performance
  presets for 4GB GPUs (Nvidia GTX 1650), and an integrated model downloader.
+

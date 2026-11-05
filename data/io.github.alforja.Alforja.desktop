@@ -10,3 +10,4 @@ Categories=System;Utility;Development;
 Keywords=llama;cpp;ai;llm;inference;server;vram;
 StartupNotify=true
 StartupWMClass=io.github.alforja.Alforja
+

@@ -60,3 +60,4 @@ install -m 0644 data/icons/hicolor/scalable/apps/io.github.alforja.Alforja.svg %
 %changelog
 * Wed Nov 05 2026 Tiago <tiago@local> - 0.1.0-1
 - Initial release of Alforja
+

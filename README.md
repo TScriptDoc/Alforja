@@ -23,7 +23,7 @@ Built with **Python**, **GTK4**, and **Libadwaita**, Alforja follows the modern 
   - **Flash Attention (`-fa`):** Reduces attention matrix memory footprint.
   - **KV Cache Quantization (`-ctk` & `-ctv`):** `q4_0` and `q8_0` cache types halve context VRAM requirements.
   - **Micro-Batch Size (`-ub`):** Smooths peak allocation spikes during prompt processing.
-  - **Context Shift (`--ctx-shift`):** Prevents crashes when conversations exceed the context token limit.
+  - **Context Shift (`--context-shift`):** Prevents crashes when conversations exceed the context token limit.
 - **Dynamic Flag Builder:** Add any custom `llama.cpp` CLI argument (e.g., `--timeout`, `--temp`, `--top-p`) via an interactive key-value editor.
 
 ### 4. The Pack: Models & Direct URL Downloader

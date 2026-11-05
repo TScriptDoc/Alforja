@@ -1040,7 +1040,7 @@ class AlforjaWindow(Adw.ApplicationWindow):
         opt_group.add(self.spin_parallel)
 
         self.switch_ctx_shift = Adw.SwitchRow(
-            title="Context Shift (--ctx-shift)",
+            title="Context Shift (--context-shift)",
             subtitle="Discards older context tokens to keep chatting without crashing.",
         )
         self.switch_ctx_shift.set_active(True)
@@ -1493,7 +1493,7 @@ class AlforjaWindow(Adw.ApplicationWindow):
         ]
 
         if cfg["ctx_shift"]:
-            args.append("--ctx-shift")
+            args.append("--context-shift")
 
         if self.active_mmproj_path and self.active_mmproj_path.exists():
             args.extend(["--mmproj", str(self.active_mmproj_path)])

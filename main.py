@@ -1251,15 +1251,26 @@ class AlforjaWindow(Adw.ApplicationWindow):
             return
 
         for name, size_mb, path in models:
-            is_mmproj = ".mmproj" in name
-            tag = "Vision Projector" if is_mmproj else "Base Model"
+            is_mmproj = ".mmproj" in name or "mmproj" in name.lower()
             size_str = (
                 f"{size_mb / 1024:.2f} GB" if size_mb >= 1024 else f"{size_mb:.1f} MB"
             )
 
+            if is_mmproj:
+                tag = "Vision Projector"
+                sub_detail = f"{tag} • {size_str}"
+            else:
+                matched_proj = self.find_matching_mmproj(name)
+                if matched_proj:
+                    tag = "Base Model (Vision Capable)"
+                    sub_detail = f"{tag} • {size_str} • 👁️ mmproj found"
+                else:
+                    tag = "Base Model (Text Only)"
+                    sub_detail = f"{tag} • {size_str}"
+
             row = Adw.ActionRow(
                 title=name,
-                subtitle=f"{tag} • {size_str}",
+                subtitle=sub_detail,
             )
             icon_name = (
                 "video-display-symbolic"
@@ -1275,6 +1286,12 @@ class AlforjaWindow(Adw.ApplicationWindow):
             if is_active:
                 badge = Gtk.Label(label="Active")
                 badge.add_css_class("accent")
+                badge.set_valign(Gtk.Align.CENTER)
+                badge.set_margin_end(6)
+                row.add_suffix(badge)
+            elif is_mmproj:
+                badge = Gtk.Label(label="Projector")
+                badge.add_css_class("dim-label")
                 badge.set_valign(Gtk.Align.CENTER)
                 badge.set_margin_end(6)
                 row.add_suffix(badge)
@@ -1574,6 +1591,9 @@ class AlforjaWindow(Adw.ApplicationWindow):
 
         if self.active_mmproj_path and self.active_mmproj_path.exists():
             args.extend(["--mmproj", str(self.active_mmproj_path)])
+            self.on_log_message(f"[Alforja] 👁️ Multimodal vision enabled with projector: {self.active_mmproj_path.name}\n")
+        else:
+            self.on_log_message("[Alforja] ℹ️ Running in text-only mode (no vision projector linked).\n")
 
         for item in cfg["custom_args"]:
             flag = item.get("flag", "").strip()
@@ -1801,19 +1821,42 @@ class AlforjaWindow(Adw.ApplicationWindow):
                 self.set_active_model(models[0][2])
         self.refresh_models_list()
 
+    def find_matching_mmproj(self, model_name: str) -> Path | None:
+        """Finds matching multimodal vision projector for a model filename."""
+        if not DEFAULT_MODELS_DIR.exists():
+            return None
+        clean = re.sub(r"(\.[qQ]\d[^.]*|\.gguf)$", "", model_name).lower()
+        parts = re.split(r"[-_.\s]+", clean)
+        family = parts[0] if parts else ""
+        if not family or len(family) < 3:
+            return None
+
+        best_match = None
+        best_score = 0
+        for item in DEFAULT_MODELS_DIR.glob("*.gguf"):
+            item_lower = item.name.lower()
+            if "mmproj" not in item_lower:
+                continue
+            if family not in item_lower:
+                continue
+            score = sum(1 for p in parts if p in item_lower)
+            if score > best_score:
+                best_score = score
+                best_match = item
+        return best_match
+
     def set_active_model(self, model_path: Path):
         self.active_model_path = model_path
         name = model_path.name
-        self.row_active_model.set_subtitle(name)
-        self.row_config_model.set_subtitle(name)
 
-        base_prefix = name.split(".")[0]
-        self.active_mmproj_path = None
-        for item in DEFAULT_MODELS_DIR.glob("*.gguf"):
-            if ".mmproj" in item.name and base_prefix.lower() in item.name.lower():
-                self.active_mmproj_path = item
-                break
+        self.active_mmproj_path = self.find_matching_mmproj(name)
+        if self.active_mmproj_path and self.active_mmproj_path.exists():
+            sub_text = f"{name} (👁️ Vision Projector: {self.active_mmproj_path.name})"
+        else:
+            sub_text = f"{name} (Text Only)"
 
+        self.row_active_model.set_subtitle(sub_text)
+        self.row_config_model.set_subtitle(sub_text)
         self.save_active_config()
 
 

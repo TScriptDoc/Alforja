@@ -48,6 +48,7 @@ DEFAULT_MODELS_DIR = Path.home() / ".local" / "llama.cpp" / "models"
 CONFIG_DIR = Path.home() / ".config" / "alforja"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 PROFILES_FILE = CONFIG_DIR / "profiles.json"
+MODELS_CONFIG_FILE = CONFIG_DIR / "models_config.json"
 
 
 DEFAULT_PROFILES = {
@@ -1754,6 +1755,14 @@ class AlforjaWindow(Adw.ApplicationWindow):
         self._loading_config = True
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 
+        self.model_configs = {}
+        if MODELS_CONFIG_FILE.exists():
+            try:
+                with open(MODELS_CONFIG_FILE, "r", encoding="utf-8") as f:
+                    self.model_configs = json.load(f)
+            except Exception as exc:
+                print(f"[Config] Error reading model configs: {exc}")
+
         self.profiles = dict(DEFAULT_PROFILES)
         if PROFILES_FILE.exists():
             try:
@@ -1791,7 +1800,7 @@ class AlforjaWindow(Adw.ApplicationWindow):
             idx = profile_names.index(self.active_profile_name)
             self.combo_profile.set_selected(idx)
 
-    def apply_config_to_ui(self, cfg: dict):
+    def apply_config_to_ui(self, cfg: dict, set_model: bool = True):
         self._loading_config = True
 
         self.spin_ctx.set_value(cfg.get("ctx_size", 2048))
@@ -1823,11 +1832,12 @@ class AlforjaWindow(Adw.ApplicationWindow):
             if isinstance(item, dict):
                 self.add_custom_arg_row(item.get("flag", ""), item.get("value", ""))
 
-        saved_model = cfg.get("active_model")
-        if saved_model:
-            model_p = Path(saved_model)
-            if model_p.exists():
-                self.set_active_model(model_p)
+        if set_model:
+            saved_model = cfg.get("active_model")
+            if saved_model:
+                model_p = Path(saved_model)
+                if model_p.exists():
+                    self.set_active_model(model_p)
 
         self._loading_config = False
 
@@ -1875,6 +1885,16 @@ class AlforjaWindow(Adw.ApplicationWindow):
                 json.dump(cfg, f, indent=2)
         except Exception as exc:
             print(f"[Config] Error saving config: {exc}")
+
+        # Automatically remember settings tailored for the active model
+        if self.active_model_path:
+            mname = self.active_model_path.name
+            self.model_configs[mname] = dict(cfg)
+            try:
+                with open(MODELS_CONFIG_FILE, "w", encoding="utf-8") as f:
+                    json.dump(self.model_configs, f, indent=2)
+            except Exception as exc:
+                print(f"[Config] Error saving per-model config: {exc}")
 
     def on_profile_selected(self, _combo, _param):
         if self._loading_config:
@@ -1948,6 +1968,15 @@ class AlforjaWindow(Adw.ApplicationWindow):
 
         self.row_active_model.set_subtitle(sub_text)
         self.row_config_model.set_subtitle(sub_text)
+
+        # Restore saved model-specific parameters if previously configured
+        if hasattr(self, "model_configs") and name in self.model_configs:
+            saved_cfg = self.model_configs[name]
+            self.apply_config_to_ui(saved_cfg, set_model=False)
+            self.on_log_message(
+                f"[Alforja] Restored settings for {name}: {saved_cfg.get('gpu_layers', 24)} GPU layers, {saved_cfg.get('ctx_size', 2048)} ctx.\n"
+            )
+
         self.save_active_config()
 
 

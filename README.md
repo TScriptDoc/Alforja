@@ -8,17 +8,24 @@ Built with **Python**, **GTK4**, and **Libadwaita**, Alforja follows the modern 
 
 ## Key Features
 
-### 1. The Halter: Granular Daemon Control
+### 1. The Halter: Granular Daemon Control & Alpaca Integration
 - **Full Lifecycle Control:** **Start**, **Stop** (`SIGTERM` with fallback to `SIGKILL`), **Pause** (`SIGSTOP`), and **Resume** (`SIGCONT`).
   - *The Pause feature sends `SIGSTOP` to freeze computation and preserve model weights in VRAM without unloading, instantly resuming when toggled.*
+- **Seamless Alpaca Chat Integration:** Launch the GNOME Flatpak chat client **Alpaca** directly into the same air-gapped bubble with full host filesystem access for media/vision uploads.
 - **Real-Time Terminal Output:** Monospace log console streaming `stdout`/`stderr` non-blocking via `GLib.idle_add` with auto-scroll and clear controls.
 
-### 2. Strict Offline Security & Network Sandbox
-- **Physically Isolated:** Launches `llama-server` wrapped in Linux `unshare -r -n` namespaces, eliminating network access and loopback exfiltration.
+### 2. Live Hardware Telemetry & Inference Speed Graph
+- **GTX 1650 VRAM & Compute Meters:** Real-time VRAM allocation and GPU core usage monitoring via `nvidia-smi`.
+- **System CPU & RAM Meters:** Live host core utilization and RAM tracking.
+- **Tokens/Sec Sparkline Graph:** Real-time Cairo-rendered sparkline graph displaying prompt processing speed and generation tokens/second with peak statistics.
+- **Power Saver Toggle:** Enable or disable live polling on the fly to save CPU/GPU cycles.
+
+### 3. Strict Offline Security & Network Sandbox
+- **Physically Isolated:** Launches `llama-server` wrapped in Linux `unshare -r -n` namespaces, eliminating network access and loopback exfiltration while enabling internal loopback (`lo`).
 - **Zero Telemetry:** Strictly offline. Zero analytics, zero background pings, zero auto-updates.
 
-### 3. The Harness: Hardware-Tuned Configuration & Profiles
-- **Persistent Profiles:** Automatically saves settings to `~/.config/alforja/config.json`. Includes named presets (*"GTX 1650 (Default 4GB Safe)"*, *"Low VRAM / 4K Context (KV Quantized)"*, *"CPU & GPU Balanced"*).
+### 4. The Harness: Hardware-Tuned Configuration & Per-Model Persistence
+- **Per-Model Memory Persistence:** Automatically saves and restores tailored parameters (context size, GPU layers, cache quantization) for each model independently in `~/.config/alforja/models_config.json`.
 - **VRAM Optimizations for 4GB GPUs:**
   - **Flash Attention (`-fa`):** Reduces attention matrix memory footprint.
   - **KV Cache Quantization (`-ctk` & `-ctv`):** `q4_0` and `q8_0` cache types halve context VRAM requirements.
@@ -26,9 +33,10 @@ Built with **Python**, **GTK4**, and **Libadwaita**, Alforja follows the modern 
   - **Context Shift (`--context-shift`):** Prevents crashes when conversations exceed the context token limit.
 - **Dynamic Flag Builder:** Add any custom `llama.cpp` CLI argument (e.g., `--timeout`, `--temp`, `--top-p`) via an interactive key-value editor.
 
-### 4. The Pack: Models & Direct URL Downloader
+### 5. The Pack: Models, Vision Adapters & Direct Downloader
 - **Local Scanner:** Automatically maps `.gguf` weights and `.mmproj` vision adapters located in `~/.local/llama.cpp/models`.
-- **One-Click Activation:** Set any model as the active target; automatically links matching vision projectors.
+- **Vision-Aware Activation:** Instant one-click model swapping; automatically matches and binds multimodal projectors (e.g., `Qwen2.5-VL` or `MiniCPM`). Automatically hot-restarts the daemon if running.
+- **Model Deletion:** Delete old or oversized models and projectors with a single click and native confirmation dialog.
 - **Live Downloader:** Direct URL downloader for `.gguf` and `.mmproj` files with smooth progress bars, real-time speed (MB/s), ETA calculations, and atomic `.part` verification.
 
 ---

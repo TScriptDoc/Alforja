@@ -54,7 +54,7 @@ Built with **Python**, **GTK4**, and **Libadwaita**, Alforja follows the modern 
 ### Running from Source
 Clone the repository and run:
 ```bash
-git clone https://github.com/tiago/Alforja.git
+git clone https://github.com/TScriptDoc/Alforja.git
 cd Alforja
 python3 main.py
 ```

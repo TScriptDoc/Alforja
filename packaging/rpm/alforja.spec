@@ -4,7 +4,7 @@ Release:        1%{?dist}
 Summary:        Native GTK4/Libadwaita graphical manager for llama.cpp
 
 License:        MIT
-URL:            https://github.com/tiago/Alforja
+URL:            https://github.com/TScriptDoc/Alforja
 Source0:        %{name}-%{version}.tar.gz
 BuildArch:      noarch
 
